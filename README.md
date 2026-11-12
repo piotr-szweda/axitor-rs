@@ -37,7 +37,23 @@ All benchmarks were run on an **Apple M2 (macOS 15, arm64)** against Daniel's of
 
 > **Allocation Note**: Rust memory allocations are asserted via a custom `#[global_allocator]` tracking counter. Every hot-path operation in `axitor-rs` operates at **0 heap allocations**. In C#, despite aggressive `Span<T>` optimizations, framework plumbing (Task machinery, socket abstractions) still incurs 200 B – 5.6 KB of allocations per request.
 
-### 2. Hot-Path Microbenchmarks (In-Memory Decode)
+### 2. Stream Message Cost Breakdown (Where the "33x" Claim Came From)
+
+In the official `Axitor.Trading.Gateway` README, the author compared his C# implementation against existing high-level Rust clients (`binance-sdk`, `NautilusTrader`), measuring the time spent per message on parsing, routing, and delivery on top of raw socket reads:
+
+| Stream Message | binance-sdk (Rust)* | Nautilus (Rust)* | Axitor (C# .NET 10)* | axitor-rs (Zero-Alloc Rust) | Rust vs C# Axitor |
+|:---|:---:|:---:|:---:|:---:|:---:|
+| **Book Ticker** | 7.36 µs *(3.58 KB)* | 5.11 µs *(1.75 KB)* | 0.46 µs *(0 B)* | **0.12 µs** *(**0 B**)* | **~3.8x faster** |
+| **Depth Update** | 32.1 µs *(17.19 KB)* | 20.3 µs *(12.13 KB)* | 0.97 µs *(7 B)* | **0.12 µs** *(**0 B**)* | **~8.1x faster** |
+| **Agg Trade** | ~2.5 µs *(~3 KB)* | ~2.1 µs *(~2 KB)* | ~0.44 µs *(0 B)* | **0.07 µs** *(**0 B**)* | **~6.3x faster** |
+
+*\* Numbers for binance-sdk, Nautilus, and Axitor C# are taken directly from the official [Axitor.Trading.Gateway README](https://github.com/Axitor/Trading.Gateway#what-each-client-costs-per-message) benchmark tables.*
+
+**The Key Takeaway**:
+- The reason C# Axitor beat `binance-sdk` by 16x–33x is because `binance-sdk` uses standard `serde_json` and allocates thousands of bytes per message on the heap.
+- When Rust is written with equivalent zero-allocation, in-place parsing, and lock-free caching (`axitor-rs`), **Rust is ~3.8x to 8.1x faster than C# Axitor**, processing book ticker messages in **120 nanoseconds** (8.48 million msg/s) vs 460 nanoseconds in C#.
+
+### 3. Hot-Path Microbenchmarks (In-Memory Decode in axitor-rs)
 
 Measured with single-core execution on Apple M2:
 

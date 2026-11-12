@@ -25,3 +25,4 @@ Write-Host "`nTo benchmark against a live ExchangeStub server on $stubHost :"
 Write-Host "  cargo run --release --bin axitor-rs-bench rest http://$stubHost"
 Write-Host "  cargo run --release --bin axitor-rs-bench wsapi ws://$stubHost/ws-fapi/v1"
 Write-Host "  cargo run --release --bin axitor-rs-bench streams ws://$stubHost/market/stream btcusdt@bookTicker 3"
+
