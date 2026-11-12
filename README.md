@@ -37,21 +37,22 @@ All benchmarks were run on an **Apple M2 (macOS 15, arm64)** against Daniel's of
 
 > **Allocation Note**: Rust memory allocations are asserted via a custom `#[global_allocator]` tracking counter. Every hot-path operation in `axitor-rs` operates at **0 heap allocations**. In C#, despite aggressive `Span<T>` optimizations, framework plumbing (Task machinery, socket abstractions) still incurs 200 B – 5.6 KB of allocations per request.
 
-### 2. Stream Message Cost Breakdown (Where the "33x" Claim Came From)
+### 2. Context: Where Did the "33x Faster than Rust" Claim Come From?
 
-In the official `Axitor.Trading.Gateway` README, the author compared his C# implementation against existing high-level Rust clients (`binance-sdk`, `NautilusTrader`), measuring the time spent per message on parsing, routing, and delivery on top of raw socket reads:
+In the official [Axitor.Trading.Gateway README](https://github.com/Axitor/Trading.Gateway#what-each-client-costs-per-message), the author reported the following stream message processing costs on an Intel Core i7-5820K (2014):
+- **`binance-sdk` (Rust)**: **7.36 µs** (allocating 3,584 B / message)
+- **`Nautilus` (Rust)**: **5.11 µs** (allocating 1,751 B / message)
+- **`Axitor` (C# .NET 10)**: **0.46 µs** (0 B heap allocation)
 
-| Stream Message | binance-sdk (Rust)* | Nautilus (Rust)* | Axitor (C# .NET 10)* | axitor-rs (Zero-Alloc Rust) | Rust vs C# Axitor |
-|:---|:---:|:---:|:---:|:---:|:---:|
-| **Book Ticker** | 7.36 µs *(3.58 KB)* | 5.11 µs *(1.75 KB)* | 0.46 µs *(0 B)* | **0.12 µs** *(**0 B**)* | **~3.8x faster** |
-| **Depth Update** | 32.1 µs *(17.19 KB)* | 20.3 µs *(12.13 KB)* | 0.97 µs *(7 B)* | **0.12 µs** *(**0 B**)* | **~8.1x faster** |
-| **Agg Trade** | ~2.5 µs *(~3 KB)* | ~2.1 µs *(~2 KB)* | ~0.44 µs *(0 B)* | **0.07 µs** *(**0 B**)* | **~6.3x faster** |
+This comparison was the basis for the public headline: *"33x lower cost per message than the official Binance Rust SDK"*.
 
-*\* Numbers for binance-sdk, Nautilus, and Axitor C# are taken directly from the official [Axitor.Trading.Gateway README](https://github.com/Axitor/Trading.Gateway#what-each-client-costs-per-message) benchmark tables.*
-
-**The Key Takeaway**:
-- The reason C# Axitor beat `binance-sdk` by 16x–33x is because `binance-sdk` uses standard `serde_json` and allocates thousands of bytes per message on the heap.
-- When Rust is written with equivalent zero-allocation, in-place parsing, and lock-free caching (`axitor-rs`), **Rust is ~3.8x to 8.1x faster than C# Axitor**, processing book ticker messages in **120 nanoseconds** (8.48 million msg/s) vs 460 nanoseconds in C#.
+**Why this was an unequal comparison**:
+1. `binance-sdk` and `Nautilus` are general-purpose clients using standard `serde_json` and dynamic heap allocations. They allocate thousands of bytes per message on the heap.
+2. Axitor in C# was a custom-tailored, zero-allocation parser specifically written for Binance wire formats.
+3. Comparing specialized zero-alloc C# against allocating generic Rust crates naturally favored C#.
+4. As Daniel himself noted in his reply:
+   > *"Once the Rust code is written the same way, the gap is a few dozen percent, not the 33x people expect from Rust by default."*
+5. When Rust is implemented with the exact same zero-allocation and in-place parsing architecture (`axitor-rs`), it processes frames in **80 to 120 nanoseconds** (8–12 million msg/s) with **strictly 0 bytes allocated**. And when benchmarked side-by-side on identical hardware (Table 1 above), **Rust is 14% to 36% faster across the board**.
 
 ### 3. Hot-Path Microbenchmarks (In-Memory Decode in axitor-rs)
 
