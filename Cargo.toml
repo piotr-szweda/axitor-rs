@@ -1,0 +1,35 @@
+[package]
+name = "axitor-rs"
+version = "0.1.0"
+edition = "2024"
+description = "Zero-allocation, low-latency Binance Futures gateway in Rust"
+
+[lib]
+name = "axitor_rs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "axitor-rs-bench"
+path = "src/bin/axitor_rs_bench.rs"
+
+[[bin]]
+name = "gen-bench-data"
+path = "src/bin/gen_bench_data.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
+memchr = "2"
+fast-float2 = "0.2"
+hmac = "0.12"
+sha2 = "0.10"
+httparse = "1"
+base64 = "0.22"
+parking_lot = "0.12"
+arc-swap = "1"
+ryu = "1"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+
