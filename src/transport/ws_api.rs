@@ -53,6 +53,7 @@ pub enum WsApiError {
     RuleViolation(OrderRuleViolation),
     RateLimited { retry_after_ms: i64 },
     CapacityExhausted,
+    NetworkGateTimeout,
 }
 
 impl std::fmt::Display for WsApiError {
@@ -68,6 +69,7 @@ impl std::fmt::Display for WsApiError {
                 write!(f, "rate limited, retry after {retry_after_ms}ms")
             }
             Self::CapacityExhausted => write!(f, "ws-api pending slot table exhausted"),
+            Self::NetworkGateTimeout => write!(f, "network gate timed out waiting for network repair"),
         }
     }
 }
@@ -580,8 +582,11 @@ impl WsApiTransport {
         method: &[u8],
         parse: impl FnOnce(&[u8]) -> Option<R>,
     ) -> Result<R, WsApiError> {
-        // Wait until network gate is open (halts during bans or disconnects)
-        self.network_gate.wait_until_open().await;
+        // Wait until network gate is open (bounded by timeout, never hangs indefinitely)
+        self.network_gate
+            .wait_until_open_timeout(self.request_timeout)
+            .await
+            .map_err(|_| WsApiError::NetworkGateTimeout)?;
 
         let lane = self.pick_lane();
         let (req_id, slot_idx) = lane

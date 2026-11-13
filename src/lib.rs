@@ -137,4 +137,30 @@ mod integration_unit_tests {
         assert!(!gate.is_tripped());
         wd.stop();
     }
+
+    #[tokio::test]
+    async fn network_gate_timeout_and_repair_worker_auto_heal() {
+        let gate = NetworkGate::new();
+        gate.trip();
+        assert!(gate.is_tripped());
+
+        // Test timeout: wait with 20ms timeout should fail
+        let res = gate.wait_until_open_timeout(std::time::Duration::from_millis(20)).await;
+        assert!(res.is_err());
+
+        // Spawn a local TCP listener to act as healthy probe target
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+
+        let worker = crate::resiliency::NetworkRepairWorker::new(
+            std::sync::Arc::clone(&gate),
+            addr,
+            std::time::Duration::from_millis(20),
+        );
+        worker.start();
+
+        // Gate should be automatically repaired by worker!
+        gate.wait_until_open_timeout(std::time::Duration::from_millis(500)).await.unwrap();
+        assert!(!gate.is_tripped());
+    }
 }

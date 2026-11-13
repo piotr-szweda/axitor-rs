@@ -31,6 +31,7 @@ pub enum RestError {
     RateLimited { retry_after_ms: i64 },
     MaybeSent(String),
     IpBanned { status: u16, body_preview: String },
+    NetworkGateTimeout,
 }
 
 impl std::fmt::Display for RestError {
@@ -50,6 +51,9 @@ impl std::fmt::Display for RestError {
             }
             Self::IpBanned { status, body_preview } => {
                 write!(f, "IP banned / rate limit exceeded (HTTP {status}): {body_preview}")
+            }
+            Self::NetworkGateTimeout => {
+                write!(f, "network gate timed out waiting for network repair")
             }
         }
     }
@@ -248,6 +252,10 @@ impl RestApiTransport {
         })
     }
 
+    pub fn host_port(&self) -> &str {
+        &self.url.host_port
+    }
+
     /// Pre-warms `count` persistent keep-alive connections so first hot requests avoid TCP handshake.
     pub async fn warmup(&self, count: usize) -> Result<(), RestError> {
         let n = count.min(self.max_pool);
@@ -297,8 +305,21 @@ impl RestApiTransport {
         req_bytes: &[u8],
         parse_body: impl FnMut(&[u8]) -> Option<R>,
     ) -> Result<R, RestError> {
-        // 1. Wait until network gate is open (halts during bans or disconnects)
-        self.network_gate.wait_until_open().await;
+        self.execute_with_gate_timeout(req_bytes, self.request_timeout, parse_body)
+            .await
+    }
+
+    async fn execute_with_gate_timeout<R>(
+        &self,
+        req_bytes: &[u8],
+        gate_timeout: Duration,
+        parse_body: impl FnMut(&[u8]) -> Option<R>,
+    ) -> Result<R, RestError> {
+        // 1. Wait until network gate is open (bounded by gate_timeout, never hangs indefinitely)
+        self.network_gate
+            .wait_until_open_timeout(gate_timeout)
+            .await
+            .map_err(|_| RestError::NetworkGateTimeout)?;
 
         // 2. Enforce request timeout
         match tokio::time::timeout(self.request_timeout, self.execute_inner(req_bytes, parse_body)).await {
@@ -635,7 +656,9 @@ impl RestApiTransport {
             Some(&self.api_secret),
             true,
         );
-        self.execute(wire, parse_order).await
+        // Emergency cancel: bound gate wait to max 500ms so cancels are never stuck behind dead streams
+        let gate_timeout = self.request_timeout.min(Duration::from_millis(500));
+        self.execute_with_gate_timeout(wire, gate_timeout, parse_order).await
     }
 
     /// `PUT /fapi/v1/order` (modify order price/quantity)
@@ -675,7 +698,9 @@ impl RestApiTransport {
             Some(&self.api_secret),
             true,
         );
-        self.execute(wire, parse_order).await
+        // Emergency cancel: bound gate wait to max 500ms so cancels are never stuck behind dead streams
+        let gate_timeout = self.request_timeout.min(Duration::from_millis(500));
+        self.execute_with_gate_timeout(wire, gate_timeout, parse_order).await
     }
 
     /// `DELETE /fapi/v1/allOpenOrders`

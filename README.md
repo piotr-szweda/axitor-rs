@@ -60,29 +60,29 @@ Measured with single-core execution on Apple M2:
 
 | Parser / Component | Latency (ns / op) | Throughput (ops / sec) | Heap Allocations |
 |:---|:---:|:---:|:---:|
-| `parse_agg_trade` | **65.4 ns** | **15.30 M msg/s** | **0 B** |
-| `parse_book_ticker` | **103.7 ns** | **9.64 M msg/s** | **0 B** |
-| `parse_depth_update` | **112.8 ns** | **8.87 M msg/s** | **0 B** |
-| `dispatch_stream (BookTicker + SeqLock publish)` | **128.2 ns** | **7.80 M msg/s** | **0 B** |
-| `parse_klines_into (500 bars into slice)` | **41.7 µs** | **24.00 K ops/s** | **0 B** |
-| `StackHttpRequest + HMAC-SHA256 signing` | **1.09 µs** | **0.91 M ops/s** | **0 B** |
-| `StackWsApiRequest + HMAC-SHA256 signing` | **1.39 µs** | **0.72 M ops/s** | **0 B** |
+| `parse_agg_trade` | **67.38 ns** | **14.84 M msg/s** | **0 B** |
+| `parse_book_ticker` | **78.87 ns** | **12.68 M msg/s** | **0 B** |
+| `parse_depth_update` | **116.06 ns** | **8.62 M msg/s** | **0 B** |
+| `dispatch_stream (BookTicker + SeqLock publish)` | **122.84 ns** | **8.14 M msg/s** | **0 B** |
+| `parse_klines_into (500 bars into slice)` | **41.00 µs** | **24.39 K ops/s** | **0 B** |
+| `StackHttpRequest + HMAC-SHA256 signing` | **1.03 µs** | **0.97 M ops/s** | **0 B** |
+| `StackWsApiRequest + HMAC-SHA256 signing` | **1.38 µs** | **0.72 M ops/s** | **0 B** |
 
 ### 4. Performance Impact of Full Safety & Resiliency Checks (Before vs After)
 
-To test whether adding production safeguards (ADR-0009 `MaybeSent` double-order guard, 16 MB frame bounds check, RFC 6455 UTF-8 validation, live atomic stream watchdog feeding, and network gate tripping) degrades zero-alloc speed, here is the side-by-side comparison on identical hardware:
+To test whether adding full production safeguards (ADR-0009 `MaybeSent` double-order guard, 16 MB frame bounds check, RFC 6455 UTF-8 validation, active watchdog feeding, bounded gate timeouts, and automatic background `NetworkRepairWorker` auto-healing) degrades zero-alloc speed, here is the side-by-side comparison on identical hardware:
 
-| Benchmark Operation | Baseline (Before Resiliency Fixes) | After Full Resiliency & Safety Checks | Allocations (Before / After) | Overhead of Added Checks |
+| Benchmark Operation | Baseline (Initial Draft) | After Full Resiliency, Safety & Auto-Repair | Allocations (Before / After) | Overhead of Added Checks |
 |:---|:---:|:---:|:---:|:---:|
-| `parse_agg_trade` | 67.8 ns *(14.75M/s)* | **65.4 ns** *(15.30M/s)* | **0 B / 0 B** | None (0 ns) |
-| `parse_book_ticker` | 80.4 ns *(12.44M/s)* | **103.7 ns** *(9.64M/s)* | **0 B / 0 B** | Field switch to `event_time` |
-| `parse_depth_update` | 118.7 ns *(8.42M/s)* | **112.8 ns** *(8.87M/s)* | **0 B / 0 B** | None (0 ns) |
-| `dispatch_stream` (SeqLock + Watchdog feed) | 126.0 ns *(7.93M/s)* | **128.2 ns** *(7.80M/s)* | **0 B / 0 B** | Relaxed atomic store (`~1 ns`) |
-| `parse_klines_into` (500 bars) | 42.9 µs *(23.27K/s)* | **41.7 µs** *(24.00K/s)* | **0 B / 0 B** | None (0 ns) |
-| `StackHttpRequest` + HMAC-SHA256 | 1.05 µs *(0.95M/s)* | **1.09 µs** *(0.91M/s)* | **0 B / 0 B** | None (0 ns) |
-| `StackWsApiRequest` + HMAC-SHA256 | 1.49 µs *(0.67M/s)* | **1.39 µs** *(0.72M/s)* | **0 B / 0 B** | None (0 ns) |
+| `parse_agg_trade` | 67.8 ns *(14.75M/s)* | **67.38 ns** *(14.84M/s)* | **0 B / 0 B** | None (0 ns) |
+| `parse_book_ticker` | 80.4 ns *(12.44M/s)* | **78.87 ns** *(12.68M/s)* | **0 B / 0 B** | None (0 ns) |
+| `parse_depth_update` | 118.7 ns *(8.42M/s)* | **116.06 ns** *(8.62M/s)* | **0 B / 0 B** | None (0 ns) |
+| `dispatch_stream` (SeqLock + Watchdog feed) | 126.0 ns *(7.93M/s)* | **122.84 ns** *(8.14M/s)* | **0 B / 0 B** | Relaxed atomic store (`~1 ns`) |
+| `parse_klines_into` (500 bars) | 42.9 µs *(23.27K/s)* | **41.00 µs** *(24.39K/s)* | **0 B / 0 B** | None (0 ns) |
+| `StackHttpRequest` + HMAC-SHA256 | 1.05 µs *(0.95M/s)* | **1.03 µs** *(0.97M/s)* | **0 B / 0 B** | None (0 ns) |
+| `StackWsApiRequest` + HMAC-SHA256 | 1.49 µs *(0.67M/s)* | **1.38 µs** *(0.72M/s)* | **0 B / 0 B** | None (0 ns) |
 
-**Conclusion**: The checks (predicted branch for `MAX_FRAME_SIZE`, single atomic store for `StreamWatchdog`, and removing request retries on in-flight sockets) add **< 1 nanosecond** overhead. The zero-allocation model remains strictly at **0 B heap allocations**.
+**Conclusion**: The checks (predicted branch for `MAX_FRAME_SIZE`, single atomic store for `StreamWatchdog`, removing request retries on in-flight sockets, bounded gate timeouts, and background repair probing) add **zero measurable overhead**. The zero-allocation model remains strictly at **0 B heap allocations**.
 
 ---
 
@@ -124,20 +124,44 @@ $$\frac{364\,644 \text{ messages}}{1.05 \text{ seconds}} \approx 347\,280 \text{
 
 | Gateway Component | C# (.NET 10) Implementation | Rust (`axitor-rs`) Implementation | Status |
 |:---|:---|:---|:---:|
-| **Raw WebSocket Transport** | Custom RFC 6455 engine, pooled buffers | `src/transport/ws_frame.rs`, `ws_streams.rs` (raw `TcpStream`, u64 XOR masking, static dispatch, `MAX_FRAME_SIZE = 16MB`, UTF-8 check) | ✅ Identical |
-| **HTTP/1.1 Connection Pool** | Custom HTTP keep-alive client | `src/transport/rest_api.rs` (persistent `TcpStream` pool, `httparse`, chunked decoding, request timeout, ADR-0009 order safety) | ✅ Identical |
-| **WS-API Slot Table** | Pre-allocated 256 pending slots | `src/transport/ws_api.rs` (`WsApiPendingTable`, custom zero-alloc `Future`, request timeout, gate check) | ✅ Identical |
+| **Raw WebSocket Transport** | .NET `ClientWebSocket` (pooled memory buffers, `SocketsHttpHandler`) | `src/transport/ws_frame.rs`, `ws_streams.rs` (custom RFC 6455 engine over raw `TcpStream`, u64 XOR masking, static dispatch, `MAX_FRAME_SIZE = 16MB`, UTF-8 check) | ✅ Parity *(Rust hand-rolled)* |
+| **HTTP/1.1 Connection Pool** | .NET `HttpClient` (`SocketsHttpHandler` connection pool) | `src/transport/rest_api.rs` (custom persistent `TcpStream` pool, `httparse`, chunked decoding, bounded timeouts, ADR-0009 order safety) | ✅ Parity *(Rust hand-rolled)* |
+| **WS-API Slot Table** | Pre-allocated 256 pending slots | `src/transport/ws_api.rs` (`WsApiPendingTable`, custom zero-alloc `Future`, bounded timeout, gate check) | ✅ Identical |
 | **Fast Decimal & JSON** | Utf8JsonReader / custom Spans | `src/parsing/fast_decimal.rs`, `json_scanner.rs`, `utf8_reader.rs` | ✅ Identical |
 | **Market Streams** | `bookTicker`, `aggTrade`, `depth`, `kline` | `src/parsing/streams.rs` (in-place zero-copy parsing, canonical `event_time`) | ✅ Identical |
 | **Order Book Engine** | Flat array book, delta buffer, sync worker | `src/order_book.rs` (`OrderBookSet`, `SnapshotFetcher`, delta sequencing) | ✅ Identical |
 | **Lock-free State Cache** | Custom sequence lock | `src/concurrency/seqlock.rs` (`SeqLock`, `LatestCache<T>`) | ✅ Identical |
 | **Multi-Window Rate Limiter** | Atomic sliding window counters | `src/rate_limiter.rs` (`BinanceRateLimiter`: 1m / 10s weight & order quotas) | ✅ Identical |
-| **Stream Watchdog** | Inactivity timeout detector | `src/resiliency/watchdog.rs` (`StreamWatchdog`: live message feeding on shard loop) | ✅ Identical |
-| **Network Gate** | Atomic trip & recovery barrier | `src/resiliency/network_gate.rs` (`NetworkGate`: active pre-request gating, ban trip on 418/429) | ✅ Identical |
+| **Stream Watchdog** | Inactivity timeout detector | `src/resiliency/watchdog.rs` (`StreamWatchdog`: live frame feeding on shard loop, trips gate on silence) | ✅ Identical |
+| **Network Gate & Auto-Repair** | Atomic circuit breaker + `NetworkRepairWorker` | `src/resiliency/network_gate.rs` (`NetworkGate` + `NetworkRepairWorker`: bounded timeouts, auto-heals on probe success, emergency cancel fast-path) | ✅ Identical |
+| **Stream Auto-Reconnect** | Shard reconnect on drop | `src/client.rs` (`spawn_stream_reconnect_supervisor`: auto-reconnects on drop/timeout, re-subscribes, heals gate) | ✅ Identical |
 | **24h Shard Rotator** | Make-before-break rotator | `src/resiliency/rotator.rs` (`MakeBeforeBreakRotator`) | ✅ Identical |
-| **Order Safety & Rules** | Preflight filters & double-order guard | `src/order_rules.rs`, `rest_api.rs` (preflight filters, zero retries on in-flight orders: ADR-0009 `MaybeSent`) | ✅ Identical |
+| **Order Safety & Rules** | Preflight filters & double-order guard | `src/order_rules.rs`, `rest_api.rs` (preflight filters, ADR-0009 `MaybeSent`, bounded emergency cancel timeout) | ✅ Identical |
 | **User Data Engine** | Account & order updates | `src/parsing/user_data.rs` (`ORDER_TRADE_UPDATE`, `ACCOUNT_UPDATE`, etc.) | ✅ Identical |
 | **ListenKey Manager** | 30m async keepalive loop | `src/user_data/listen_key.rs` (`ListenKeyManager` background worker) | ✅ Identical |
+
+---
+
+## Why Plain Loopback TCP for Benchmarks (and the TLS Context)
+
+In public discussions, questions were raised about why `axitor-rs` benchmarks over plain TCP (`http://` and `ws://`) rather than TLS (`https://` and `wss://`):
+
+1. **ExchangeStub Itself Runs on Plain TCP**:
+   - The official `Axitor.Trading.Gateway.Benchmarks.ExchangeStub` server runs on `http://127.0.0.1:5100` and `ws://127.0.0.1:5100` without TLS (as defined in `bench/run-bench.ps1` and `ExchangeStub/Program.cs`).
+   - The author's own benchmarks measuring C# against `binance-sdk` and `Nautilus` were executed over plain loopback TCP against this exact stub.
+   - Running a client with TLS encryption against an unencrypted local mock server is neither possible nor an apples-to-apples comparison.
+
+2. **Isolating Architectural Gateway Overhead from Crypto**:
+   - The purpose of low-latency trading engine benchmarks is to measure:
+     - Memory allocations on the hot path (heap garbage vs zero allocations).
+     - Wire framing overhead (RFC 6455 masking, HTTP/1.1 header formatting).
+     - In-memory parsing latency (JSON scanning, fast decimal float conversion).
+     - Concurrency primitives (SeqLock publishing, lock-free routing).
+   - In benchmark conditions, TLS symmetric cryptography (AES-128-GCM, ChaCha20-Poly1305) is CPU-bound work executed by OS libraries (Schannel, OpenSSL) or `rustls`. Including crypto would simply benchmark hardware AES acceleration rather than client architecture.
+
+3. **BCL Delegation vs Custom Transports**:
+   - In C#, TLS is not a custom engineering accomplishment of the gateway; it is provided out-of-the-box by the .NET BCL (`System.Net.WebSockets.ClientWebSocket` and `HttpClient`).
+   - In Rust, production TLS is achieved by wrapping `TcpStream` with `tokio-rustls`. For benchmarking against `ExchangeStub`, plain TCP ensures strict comparability.
 
 ---
 

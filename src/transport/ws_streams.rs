@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 
 pub const MAX_STREAM_NAME_LEN: usize = 64;
 
@@ -372,6 +372,7 @@ pub trait StreamHandler: Send + 'static {
 }
 
 /// Default lock-free state store handler backed by `LatestCache<T>` + `OrderBookSet`.
+#[derive(Clone)]
 pub struct MarketStateHandler {
     pub book_tickers: Arc<LatestCache<BookTickerModel>>,
     pub agg_trades: Arc<LatestCache<AggTradeModel>>,
@@ -504,7 +505,7 @@ impl WsStreamShard {
         registry: Arc<WsStreamRegistry>,
         handler: H,
     ) -> Result<Self, String> {
-        Self::connect_with_resiliency(url, registry, handler, None, None).await
+        Self::connect_with_resiliency(url, registry, handler, None, None, None).await
     }
 
     pub async fn connect_with_resiliency<H: StreamHandler>(
@@ -513,6 +514,7 @@ impl WsStreamShard {
         handler: H,
         watchdog_feed: Option<Arc<AtomicI64>>,
         network_gate: Option<Arc<NetworkGate>>,
+        reconnect_notify: Option<Arc<Notify>>,
     ) -> Result<Self, String> {
         let parsed = ParsedWsUrl::parse(url, "")?;
         let mut read_buf = WsReadBuffer::new(256 * 1024);
@@ -535,6 +537,7 @@ impl WsStreamShard {
             disc_c,
             watchdog_feed,
             network_gate,
+            reconnect_notify,
         ));
 
         Ok(Self {
@@ -591,6 +594,7 @@ async fn run_shard_loop<H: StreamHandler>(
     disconnected: Arc<AtomicBool>,
     watchdog_feed: Option<Arc<AtomicI64>>,
     network_gate: Option<Arc<NetworkGate>>,
+    reconnect_notify: Option<Arc<Notify>>,
 ) {
     let (mut reader, mut writer) = tokio::io::split(stream);
     let mut write_scratch = Vec::<u8>::with_capacity(4096);
@@ -702,6 +706,9 @@ async fn run_shard_loop<H: StreamHandler>(
     if !graceful_close {
         if let Some(ref gate) = network_gate {
             gate.trip();
+        }
+        if let Some(ref notify) = reconnect_notify {
+            notify.notify_waiters();
         }
     }
     for (_, ack) in pending_acks.drain() {

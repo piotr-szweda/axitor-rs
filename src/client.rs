@@ -8,7 +8,7 @@ use crate::primitives::{
     PartialDepthModel, Symbol, TickerPriceModel,
 };
 use crate::rate_limiter::{BinanceLimits, BinanceRateLimiter};
-use crate::resiliency::{MakeBeforeBreakRotator, NetworkGate, StreamWatchdog};
+use crate::resiliency::{MakeBeforeBreakRotator, NetworkGate, NetworkRepairWorker, StreamWatchdog};
 use crate::transport::rest_api::{RestApiTransport, RestError};
 use crate::transport::ws_api::{WsApiError, WsApiTransport};
 use crate::transport::ws_streams::{
@@ -64,6 +64,7 @@ pub struct BinanceClient {
     ws_api: OnceCell<Arc<WsApiTransport>>,
     pub registry: Arc<WsStreamRegistry>,
     pub network_gate: Arc<NetworkGate>,
+    pub repair_worker: Arc<NetworkRepairWorker>,
     pub reconnect_notify: Arc<Notify>,
     pub watchdog: Arc<Mutex<StreamWatchdog>>,
     pub active_shard: Arc<Mutex<Option<WsStreamShard>>>,
@@ -120,19 +121,27 @@ impl BinanceClient {
             options.depth_snapshot_limit.max(5) as usize,
         );
 
+        let repair_worker = Arc::new(NetworkRepairWorker::new(
+            Arc::clone(&network_gate),
+            rest.host_port().to_string(),
+            Duration::from_millis(500),
+        ));
+        repair_worker.start();
+
         Ok(Self {
             options,
             rate_limiter,
             rest,
             ws_api: OnceCell::new(),
             registry: Arc::new(WsStreamRegistry::new()),
+            network_gate: Arc::clone(&network_gate),
+            repair_worker,
             reconnect_notify: Arc::clone(&reconnect_notify),
             watchdog: Arc::new(Mutex::new(StreamWatchdog::new(
                 watchdog_timeout,
                 Arc::clone(&network_gate),
                 reconnect_notify,
             ))),
-            network_gate,
             active_shard: Arc::new(Mutex::new(None)),
             book_tickers: Arc::new(LatestCache::new(cap)),
             agg_trades: Arc::new(LatestCache::new(cap)),
@@ -189,6 +198,7 @@ impl BinanceClient {
             handler,
             Some(feed),
             Some(Arc::clone(&self.network_gate)),
+            Some(Arc::clone(&self.reconnect_notify)),
         )
         .await
     }
@@ -205,6 +215,7 @@ impl BinanceClient {
             handler,
             Some(feed),
             Some(Arc::clone(&self.network_gate)),
+            Some(Arc::clone(&self.reconnect_notify)),
         )
         .await
     }
@@ -365,14 +376,50 @@ impl BinanceClient {
         ListenKeyManager::new(Arc::clone(&self.rest))
     }
 
-    pub fn spawn_watchdog(&self, timeout: Duration) -> StreamWatchdog {
-        let mut wd = StreamWatchdog::new(
-            timeout,
-            Arc::clone(&self.network_gate),
-            Arc::clone(&self.reconnect_notify),
-        );
-        wd.start();
-        wd
+    pub fn start_watchdog(&self) {
+        self.watchdog.lock().start();
+    }
+
+    pub fn stop_watchdog(&self) {
+        self.watchdog.lock().stop();
+    }
+
+    pub fn spawn_watchdog(&self, _timeout: Duration) {
+        self.watchdog.lock().start();
+    }
+
+    pub fn spawn_stream_reconnect_supervisor(&self) -> tokio::task::JoinHandle<()> {
+        let notify = Arc::clone(&self.reconnect_notify);
+        let registry = Arc::clone(&self.registry);
+        let url = self.options.ws_streams_url.clone();
+        let feed = self.watchdog.lock().feed_cell();
+        let gate = Arc::clone(&self.network_gate);
+        let active_slot = Arc::clone(&self.active_shard);
+        let handler = self.market_handler();
+
+        tokio::spawn(async move {
+            loop {
+                notify.notified().await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
+
+                let streams = registry.active_stream_names();
+                if let Ok(shard) = WsStreamShard::connect_with_resiliency(
+                    &url,
+                    Arc::clone(&registry),
+                    handler.clone(),
+                    Some(Arc::clone(&feed)),
+                    Some(Arc::clone(&gate)),
+                    Some(Arc::clone(&notify)),
+                )
+                .await
+                {
+                    let _ = shard.subscribe_batch(&streams).await;
+                    let mut lock = active_slot.lock();
+                    *lock = Some(shard);
+                    gate.open();
+                }
+            }
+        })
     }
 
     pub fn spawn_rotator(&self, rotation_interval: Duration) -> MakeBeforeBreakRotator {
