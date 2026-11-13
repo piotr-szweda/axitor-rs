@@ -37,6 +37,11 @@ impl StreamWatchdog {
         self.last_frame_millis.store(now, Ordering::Relaxed);
     }
 
+    #[inline(always)]
+    pub fn feed_cell(&self) -> Arc<AtomicI64> {
+        Arc::clone(&self.last_frame_millis)
+    }
+
     pub fn start(&mut self) {
         if self.active.swap(true, Ordering::SeqCst) {
             return;

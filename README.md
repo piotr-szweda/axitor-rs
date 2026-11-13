@@ -2,7 +2,7 @@
 
 A high-performance, zero-allocation Binance USD-M Futures trading gateway written in modern Rust (`edition = "2024"`).
 
-This project was built to implement and benchmark a complete, production-grade 1:1 Rust equivalent of [Axitor.Trading.Gateway](https://github.com/Axitor/Trading.Gateway) (C# .NET 10), using the exact same zero-allocation principles, custom transports, and streaming architecture—without relying on Garbage Collection, `HttpClient`/`reqwest`, `serde_json`, or `tokio-tungstenite`.
+This project was built to implement and benchmark a high-performance, zero-allocation Rust engine matching the low-latency architecture of [Axitor.Trading.Gateway](https://github.com/Axitor/Trading.Gateway) (C# .NET 10), using the exact same zero-allocation principles, custom transports, and streaming architecture—without relying on Garbage Collection, `HttpClient`/`reqwest`, `serde_json`, or `tokio-tungstenite`.
 
 ---
 
@@ -108,18 +108,18 @@ $$\frac{364\,644 \text{ messages}}{1.05 \text{ seconds}} \approx 347\,280 \text{
 
 | Gateway Component | C# (.NET 10) Implementation | Rust (`axitor-rs`) Implementation | Status |
 |:---|:---|:---|:---:|
-| **Raw WebSocket Transport** | Custom RFC 6455 engine, pooled buffers | `src/transport/ws_frame.rs`, `ws_streams.rs` (raw `TcpStream`, u64 XOR masking, static dispatch) | ✅ Identical |
-| **HTTP/1.1 Connection Pool** | Custom HTTP keep-alive client | `src/transport/rest_api.rs` (persistent `TcpStream` pool, `httparse`, chunked decoding) | ✅ Identical |
-| **WS-API Slot Table** | Pre-allocated 256 pending slots | `src/transport/ws_api.rs` (`WsApiPendingTable`, custom zero-alloc `Future`) | ✅ Identical |
+| **Raw WebSocket Transport** | Custom RFC 6455 engine, pooled buffers | `src/transport/ws_frame.rs`, `ws_streams.rs` (raw `TcpStream`, u64 XOR masking, static dispatch, `MAX_FRAME_SIZE = 16MB`, UTF-8 check) | ✅ Identical |
+| **HTTP/1.1 Connection Pool** | Custom HTTP keep-alive client | `src/transport/rest_api.rs` (persistent `TcpStream` pool, `httparse`, chunked decoding, request timeout, ADR-0009 order safety) | ✅ Identical |
+| **WS-API Slot Table** | Pre-allocated 256 pending slots | `src/transport/ws_api.rs` (`WsApiPendingTable`, custom zero-alloc `Future`, request timeout, gate check) | ✅ Identical |
 | **Fast Decimal & JSON** | Utf8JsonReader / custom Spans | `src/parsing/fast_decimal.rs`, `json_scanner.rs`, `utf8_reader.rs` | ✅ Identical |
-| **Market Streams** | `bookTicker`, `aggTrade`, `depth`, `kline` | `src/parsing/streams.rs` (all parsed in-place, zero-copy) | ✅ Identical |
+| **Market Streams** | `bookTicker`, `aggTrade`, `depth`, `kline` | `src/parsing/streams.rs` (in-place zero-copy parsing, canonical `event_time`) | ✅ Identical |
 | **Order Book Engine** | Flat array book, delta buffer, sync worker | `src/order_book.rs` (`OrderBookSet`, `SnapshotFetcher`, delta sequencing) | ✅ Identical |
 | **Lock-free State Cache** | Custom sequence lock | `src/concurrency/seqlock.rs` (`SeqLock`, `LatestCache<T>`) | ✅ Identical |
 | **Multi-Window Rate Limiter** | Atomic sliding window counters | `src/rate_limiter.rs` (`BinanceRateLimiter`: 1m / 10s weight & order quotas) | ✅ Identical |
-| **Stream Watchdog** | Inactivity timeout detector | `src/resiliency/watchdog.rs` (`StreamWatchdog`) | ✅ Identical |
-| **Network Gate** | Atomic trip & recovery barrier | `src/resiliency/network_gate.rs` (`NetworkGate`) | ✅ Identical |
+| **Stream Watchdog** | Inactivity timeout detector | `src/resiliency/watchdog.rs` (`StreamWatchdog`: live message feeding on shard loop) | ✅ Identical |
+| **Network Gate** | Atomic trip & recovery barrier | `src/resiliency/network_gate.rs` (`NetworkGate`: active pre-request gating, ban trip on 418/429) | ✅ Identical |
 | **24h Shard Rotator** | Make-before-break rotator | `src/resiliency/rotator.rs` (`MakeBeforeBreakRotator`) | ✅ Identical |
-| **Order Safety & Rules** | Preflight filters validation | `src/order_rules.rs` (`preflight_order`: tick size, step size, min notional) | ✅ Identical |
+| **Order Safety & Rules** | Preflight filters & double-order guard | `src/order_rules.rs`, `rest_api.rs` (preflight filters, zero retries on in-flight orders: ADR-0009 `MaybeSent`) | ✅ Identical |
 | **User Data Engine** | Account & order updates | `src/parsing/user_data.rs` (`ORDER_TRADE_UPDATE`, `ACCOUNT_UPDATE`, etc.) | ✅ Identical |
 | **ListenKey Manager** | 30m async keepalive loop | `src/user_data/listen_key.rs` (`ListenKeyManager` background worker) | ✅ Identical |
 

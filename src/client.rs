@@ -34,6 +34,7 @@ pub struct BinanceClientOptions {
     pub ws_api_lanes: usize,
     pub max_subscriptions: usize,
     pub depth_snapshot_limit: i32,
+    pub stream_watchdog_timeout_ms: u64,
 }
 
 impl Default for BinanceClientOptions {
@@ -51,6 +52,7 @@ impl Default for BinanceClientOptions {
             ws_api_lanes: 2,
             max_subscriptions: 256,
             depth_snapshot_limit: 1000,
+            stream_watchdog_timeout_ms: 3_000,
         }
     }
 }
@@ -63,6 +65,7 @@ pub struct BinanceClient {
     pub registry: Arc<WsStreamRegistry>,
     pub network_gate: Arc<NetworkGate>,
     pub reconnect_notify: Arc<Notify>,
+    pub watchdog: Arc<Mutex<StreamWatchdog>>,
     pub active_shard: Arc<Mutex<Option<WsStreamShard>>>,
     pub book_tickers: Arc<LatestCache<BookTickerModel>>,
     pub agg_trades: Arc<LatestCache<AggTradeModel>>,
@@ -93,6 +96,10 @@ impl SnapshotFetcher for RestSnapshotFetcher {
 impl BinanceClient {
     pub fn new(options: BinanceClientOptions) -> Result<Self, String> {
         let rate_limiter = Arc::new(BinanceRateLimiter::new(&options.limits));
+        let network_gate = NetworkGate::new();
+        let reconnect_notify = Arc::new(Notify::new());
+        let timeout = Duration::from_millis(options.recv_window_ms.max(5000) as u64);
+        let watchdog_timeout = Duration::from_millis(options.stream_watchdog_timeout_ms.max(1000));
         let rest = Arc::new(
             RestApiTransport::new(
                 &options.rest_base_url,
@@ -100,7 +107,9 @@ impl BinanceClient {
                 options.api_secret.clone(),
                 options.rest_pool_size,
                 Arc::clone(&rate_limiter),
+                Arc::clone(&network_gate),
                 options.recv_window_ms,
+                timeout,
             )
             .map_err(|e| e.to_string())?,
         );
@@ -117,8 +126,13 @@ impl BinanceClient {
             rest,
             ws_api: OnceCell::new(),
             registry: Arc::new(WsStreamRegistry::new()),
-            network_gate: NetworkGate::new(),
-            reconnect_notify: Arc::new(Notify::new()),
+            reconnect_notify: Arc::clone(&reconnect_notify),
+            watchdog: Arc::new(Mutex::new(StreamWatchdog::new(
+                watchdog_timeout,
+                Arc::clone(&network_gate),
+                reconnect_notify,
+            ))),
+            network_gate,
             active_shard: Arc::new(Mutex::new(None)),
             book_tickers: Arc::new(LatestCache::new(cap)),
             agg_trades: Arc::new(LatestCache::new(cap)),
@@ -136,13 +150,16 @@ impl BinanceClient {
         let transport = self
             .ws_api
             .get_or_try_init(|| async {
+                let timeout = Duration::from_millis(self.options.recv_window_ms.max(5000) as u64);
                 WsApiTransport::connect(
                     &self.options.ws_api_url,
                     self.options.ws_api_lanes,
                     self.options.api_key.clone(),
                     self.options.api_secret.clone(),
                     Arc::clone(&self.rate_limiter),
+                    Arc::clone(&self.network_gate),
                     self.options.recv_window_ms,
+                    timeout,
                 )
                 .await
                 .map(Arc::new)
@@ -165,8 +182,15 @@ impl BinanceClient {
         &self,
         handler: H,
     ) -> Result<WsStreamShard, String> {
-        WsStreamShard::connect(&self.options.ws_streams_url, Arc::clone(&self.registry), handler)
-            .await
+        let feed = self.watchdog.lock().feed_cell();
+        WsStreamShard::connect_with_resiliency(
+            &self.options.ws_streams_url,
+            Arc::clone(&self.registry),
+            handler,
+            Some(feed),
+            Some(Arc::clone(&self.network_gate)),
+        )
+        .await
     }
 
     pub async fn connect_streams_to<H: StreamHandler>(
@@ -174,7 +198,15 @@ impl BinanceClient {
         url: &str,
         handler: H,
     ) -> Result<WsStreamShard, String> {
-        WsStreamShard::connect(url, Arc::clone(&self.registry), handler).await
+        let feed = self.watchdog.lock().feed_cell();
+        WsStreamShard::connect_with_resiliency(
+            url,
+            Arc::clone(&self.registry),
+            handler,
+            Some(feed),
+            Some(Arc::clone(&self.network_gate)),
+        )
+        .await
     }
 
     pub async fn connect_market_streams(&self) -> Result<WsStreamShard, String> {

@@ -250,6 +250,9 @@ pub async fn write_masked_frame<W: AsyncWriteExt + Unpin>(
 }
 
 /// Zero-copy WebSocket receive buffer with direct slicing into the contiguous ring/compaction buffer.
+/// Maximum allowed WebSocket frame size (16 MB) to prevent denial-of-service / unbounded allocations.
+pub const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
+
 pub struct WsReadBuffer {
     buf: Vec<u8>,
     read_pos: usize,
@@ -323,7 +326,13 @@ impl WsReadBuffer {
     pub async fn read_more<R: AsyncReadExt + Unpin>(&mut self, reader: &mut R) -> std::io::Result<usize> {
         self.compact_if_needed();
         if self.write_pos == self.buf.len() {
-            self.buf.resize(self.buf.len() * 2, 0);
+            if self.buf.len() >= MAX_FRAME_SIZE {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "WebSocket read buffer exceeded MAX_FRAME_SIZE limit (16MB)",
+                ));
+            }
+            self.buf.resize((self.buf.len() * 2).min(MAX_FRAME_SIZE), 0);
         }
         let n = reader.read(&mut self.buf[self.write_pos..]).await?;
         self.write_pos += n;
@@ -367,6 +376,12 @@ impl WsReadBuffer {
                 arr.copy_from_slice(&self.buf[base + 2..base + 10]);
                 u64::from_be_bytes(arr) as usize
             };
+
+            if payload_len > MAX_FRAME_SIZE {
+                return Err(format!(
+                    "RFC 6455 frame length {payload_len} exceeds MAX_FRAME_SIZE limit ({MAX_FRAME_SIZE})"
+                ));
+            }
 
             let mask_bytes = if masked {
                 if avail < hdr + 4 {

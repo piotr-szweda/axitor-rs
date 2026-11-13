@@ -11,6 +11,7 @@ use crate::primitives::{
     TickerPriceModel,
 };
 use crate::rate_limiter::{bucket, BinanceRateLimiter};
+use crate::resiliency::network_gate::NetworkGate;
 use crate::transport::ws_frame::{
     connect_and_handshake, encode_masked_frame, write_masked_frame, DecodedFrame, FastMaskRng,
     ParsedWsUrl, WsOpcode, WsReadBuffer,
@@ -24,6 +25,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
+use std::time::Duration;
 use tokio::io::{AsyncWriteExt, WriteHalf};
 use tokio::net::TcpStream;
 
@@ -514,7 +516,9 @@ pub struct WsApiTransport {
     api_key: String,
     api_secret: Vec<u8>,
     rate_limiter: Arc<BinanceRateLimiter>,
+    network_gate: Arc<NetworkGate>,
     recv_window_ms: i64,
+    request_timeout: Duration,
 }
 
 impl WsApiTransport {
@@ -524,7 +528,9 @@ impl WsApiTransport {
         api_key: String,
         api_secret: String,
         rate_limiter: Arc<BinanceRateLimiter>,
+        network_gate: Arc<NetworkGate>,
         recv_window_ms: i64,
+        request_timeout: Duration,
     ) -> Result<Self, WsApiError> {
         let count = lane_count.max(1);
         let mut lanes = Vec::with_capacity(count);
@@ -538,7 +544,9 @@ impl WsApiTransport {
             api_key,
             api_secret: api_secret.into_bytes(),
             rate_limiter,
+            network_gate,
             recv_window_ms,
+            request_timeout,
         })
     }
 
@@ -572,6 +580,9 @@ impl WsApiTransport {
         method: &[u8],
         parse: impl FnOnce(&[u8]) -> Option<R>,
     ) -> Result<R, WsApiError> {
+        // Wait until network gate is open (halts during bans or disconnects)
+        self.network_gate.wait_until_open().await;
+
         let lane = self.pick_lane();
         let (req_id, slot_idx) = lane
             .pending
@@ -591,15 +602,28 @@ impl WsApiTransport {
         };
         let _ = send_len;
 
-        SlotWaiter {
+        let waiter = SlotWaiter {
             table: &lane.pending,
             slot_idx,
             req_id,
+        };
+
+        match tokio::time::timeout(self.request_timeout, waiter).await {
+            Ok(res) => res?,
+            Err(_) => {
+                return Err(WsApiError::Transport(
+                    "ws-api request timed out while awaiting response: outcome unknown / maybe sent".into(),
+                ));
+            }
         }
-        .await?;
 
         let raw = unsafe { lane.pending.payload_slice(slot_idx) };
         let env = parse_ws_api_envelope(raw).ok_or(WsApiError::Parse("envelope"))?;
+
+        if env.status == 418 || env.status == 429 {
+            self.network_gate.trip();
+        }
+
         if env.status != 200 {
             return Err(WsApiError::Exchange {
                 status: env.status,

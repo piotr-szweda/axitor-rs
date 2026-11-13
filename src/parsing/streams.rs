@@ -37,7 +37,7 @@ pub fn parse_book_ticker(data: &[u8]) -> Option<(BookTickerModel, i64)> {
         ask_price,
         ask_quantity,
     };
-    Some((model, update_id))
+    Some((model, event_time))
 }
 
 #[inline]
@@ -71,7 +71,7 @@ pub fn parse_agg_trade(data: &[u8]) -> Option<(AggTradeModel, i64)> {
         quantity,
         is_buyer_maker,
     };
-    Some((model, aggregate_trade_id))
+    Some((model, event_time))
 }
 
 #[inline]
@@ -130,8 +130,8 @@ pub fn parse_partial_depth(data: &[u8]) -> Option<(PartialDepthModel, i64)> {
     model.bid_count = read_levels_into(data, b"\"b\":", &mut cursor, &mut model.bids)? as u8;
     model.ask_count = read_levels_into(data, b"\"a\":", &mut cursor, &mut model.asks)? as u8;
 
-    let uid = model.final_update_id;
-    Some((model, uid))
+    let et = model.event_time;
+    Some((model, et))
 }
 
 #[inline]
@@ -173,7 +173,7 @@ pub fn parse_kline_update(data: &[u8]) -> Option<(KlineUpdateModel, i64)> {
     model.kline.taker_buy_volume = utf8_reader::read_quoted_f64(data, b"\"V\":", &mut cursor)?;
     model.kline.taker_buy_quote_volume = utf8_reader::read_quoted_f64(data, b"\"Q\":", &mut cursor)?;
 
-    let update_id = (model.event_time << 1) | (model.is_closed as i64);
-    Some((model, update_id))
+    let et = model.event_time;
+    Some((model, et))
 }
 

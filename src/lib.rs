@@ -52,8 +52,9 @@ mod integration_unit_tests {
     #[test]
     fn book_ticker_parse_and_latest_cache_roundtrip() {
         let json = br#"{"e":"bookTicker","u":12345,"s":"BTCUSDT","b":"64250.10","B":"1.25","a":"64250.20","A":"0.75","T":1700000000100,"E":1700000000105}"#;
-        let (model, seq_id) = parse_book_ticker(json).unwrap();
-        assert_eq!(seq_id, 12345);
+        let (model, event_time) = parse_book_ticker(json).unwrap();
+        assert_eq!(event_time, 1_700_000_000_105);
+        assert_eq!(model.update_id, 12345);
         assert_eq!(model.event_time, 1_700_000_000_105);
         assert!((model.bid_price - 64250.10).abs() < 1e-9);
         assert!((model.ask_quantity - 0.75).abs() < 1e-9);

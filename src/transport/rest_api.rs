@@ -13,10 +13,12 @@ use crate::primitives::{
     Symbol, TimeInForce,
 };
 use crate::rate_limiter::{bucket, BinanceRateLimiter};
+use crate::resiliency::network_gate::NetworkGate;
 use crate::transport::ws_api::sign_hmac_sha256_hex;
 use memchr::memmem;
 use parking_lot::Mutex;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -27,6 +29,8 @@ pub enum RestError {
     Parse(&'static str),
     RuleViolation(OrderRuleViolation),
     RateLimited { retry_after_ms: i64 },
+    MaybeSent(String),
+    IpBanned { status: u16, body_preview: String },
 }
 
 impl std::fmt::Display for RestError {
@@ -40,6 +44,12 @@ impl std::fmt::Display for RestError {
             Self::RuleViolation(v) => write!(f, "order rule violation: {v:?}"),
             Self::RateLimited { retry_after_ms } => {
                 write!(f, "rate limited, retry after {retry_after_ms}ms")
+            }
+            Self::MaybeSent(s) => {
+                write!(f, "outcome unknown / maybe sent (ADR-0009 order safety): {s}")
+            }
+            Self::IpBanned { status, body_preview } => {
+                write!(f, "IP banned / rate limit exceeded (HTTP {status}): {body_preview}")
             }
         }
     }
@@ -208,7 +218,9 @@ pub struct RestApiTransport {
     pool: Mutex<Vec<KeepAliveConn>>,
     max_pool: usize,
     rate_limiter: Arc<BinanceRateLimiter>,
+    network_gate: Arc<NetworkGate>,
     recv_window_ms: i64,
+    request_timeout: Duration,
 }
 
 impl RestApiTransport {
@@ -218,7 +230,9 @@ impl RestApiTransport {
         api_secret: String,
         max_pool: usize,
         rate_limiter: Arc<BinanceRateLimiter>,
+        network_gate: Arc<NetworkGate>,
         recv_window_ms: i64,
+        request_timeout: Duration,
     ) -> Result<Self, RestError> {
         let url = ParsedHttpUrl::parse(base_url)?;
         Ok(Self {
@@ -228,7 +242,9 @@ impl RestApiTransport {
             pool: Mutex::new(Vec::with_capacity(max_pool.max(4))),
             max_pool: max_pool.max(1),
             rate_limiter,
+            network_gate,
             recv_window_ms,
+            request_timeout,
         })
     }
 
@@ -271,67 +287,95 @@ impl RestApiTransport {
 
     /// Executes an HTTP/1.1 request and invokes `parse_body(body_bytes)` directly over the
     /// pooled connection's receive buffer with zero intermediate allocations.
+    ///
+    /// Double-Order Safety (ADR-0009):
+    /// If writing to a pooled idle connection fails before sending any bytes, we retry once
+    /// with a fresh connection. However, once bytes are written to the wire, ANY connection
+    /// drop or timeout returns `RestError::MaybeSent` to strictly prevent duplicate orders.
     async fn execute<R>(
+        &self,
+        req_bytes: &[u8],
+        parse_body: impl FnMut(&[u8]) -> Option<R>,
+    ) -> Result<R, RestError> {
+        // 1. Wait until network gate is open (halts during bans or disconnects)
+        self.network_gate.wait_until_open().await;
+
+        // 2. Enforce request timeout
+        match tokio::time::timeout(self.request_timeout, self.execute_inner(req_bytes, parse_body)).await {
+            Ok(res) => res,
+            Err(_) => Err(RestError::MaybeSent(
+                "request timed out while awaiting exchange response".into(),
+            )),
+        }
+    }
+
+    async fn execute_inner<R>(
         &self,
         req_bytes: &[u8],
         mut parse_body: impl FnMut(&[u8]) -> Option<R>,
     ) -> Result<R, RestError> {
-        // Up to 1 automatic retry if an idle pooled keep-alive socket hit peer EOF.
-        for attempt in 0..2 {
-            let mut conn = if attempt == 0 {
-                self.checkout().await?
-            } else {
-                KeepAliveConn::connect(&self.url.host_port).await?
-            };
-
-            if conn.stream.write_all(req_bytes).await.is_err() {
-                if attempt == 0 {
-                    continue;
-                }
-                return Err(RestError::Transport("socket write failed".into()));
-            }
-
-            match read_http_response(&mut conn, &self.rate_limiter).await {
-                Ok(HttpBodyView {
-                    status,
-                    from_chunked,
-                    start,
-                    end,
-                    close_after,
-                }) => {
-                    let body = if from_chunked {
-                        &conn.body_buf[..end]
-                    } else {
-                        &conn.read_buf[start..end]
-                    };
-
-                    let res = if (200..300).contains(&status) {
-                        parse_body(body).ok_or(RestError::Parse("invalid response JSON"))
-                    } else {
-                        let preview = String::from_utf8_lossy(&body[..body.len().min(200)]).into_owned();
-                        Err(RestError::HttpStatus {
-                            status,
-                            body_preview: preview,
-                        })
-                    };
-
-                    if !close_after {
-                        self.checkin(conn);
-                    }
-                    return res;
-                }
-                Err(ReadErr::PeerClosedEarly) if attempt == 0 => {
-                    continue;
-                }
-                Err(ReadErr::PeerClosedEarly) => {
-                    return Err(RestError::Transport("peer closed connection".into()));
-                }
-                Err(ReadErr::Fatal(msg)) => {
-                    return Err(RestError::Transport(msg));
-                }
+        let mut conn = self.checkout().await?;
+        if conn.stream.write_all(req_bytes).await.is_err() {
+            // Write failed on pooled idle socket before any bytes were received by peer.
+            // Safe to retry once on a brand new TCP connection.
+            conn = KeepAliveConn::connect(&self.url.host_port).await?;
+            if let Err(e2) = conn.stream.write_all(req_bytes).await {
+                return Err(RestError::Transport(format!("socket write failed: {e2}")));
             }
         }
-        Err(RestError::Transport("unexpected retry exhaustion".into()))
+
+        // Bytes have been sent! Any failure past this point cannot be automatically retried
+        // because the exchange may have already processed or filled the order (ADR-0009).
+        match read_http_response(&mut conn, &self.rate_limiter).await {
+            Ok(HttpBodyView {
+                status,
+                from_chunked,
+                start,
+                end,
+                close_after,
+            }) => {
+                let body = if from_chunked {
+                    &conn.body_buf[..end]
+                } else {
+                    &conn.read_buf[start..end]
+                };
+
+                // Check for ban / rate limit
+                if status == 418 || status == 429 {
+                    self.network_gate.trip();
+                    let preview = String::from_utf8_lossy(&body[..body.len().min(200)]).into_owned();
+                    return Err(RestError::IpBanned {
+                        status,
+                        body_preview: preview,
+                    });
+                }
+
+                let res = if (200..300).contains(&status) {
+                    parse_body(body).ok_or(RestError::Parse("invalid response JSON"))
+                } else {
+                    let preview = String::from_utf8_lossy(&body[..body.len().min(200)]).into_owned();
+                    Err(RestError::HttpStatus {
+                        status,
+                        body_preview: preview,
+                    })
+                };
+
+                if !close_after {
+                    self.checkin(conn);
+                }
+                res
+            }
+            Err(ReadErr::PeerClosedEarly) => {
+                Err(RestError::MaybeSent(
+                    "peer closed connection before sending response (outcome unknown)".into(),
+                ))
+            }
+            Err(ReadErr::Fatal(msg)) => {
+                Err(RestError::MaybeSent(format!(
+                    "fatal transport error while awaiting response: {msg}"
+                )))
+            }
+        }
     }
 
     /// `GET /fapi/v1/klines` directly into caller-provided `dst` slice (0 heap allocs).

@@ -7,6 +7,7 @@ use crate::primitives::{
     AggTradeModel, BookTickerModel, DepthLevel, DepthUpdateHeader, KlineUpdateModel,
     PartialDepthModel,
 };
+use crate::resiliency::network_gate::NetworkGate;
 use crate::transport::ws_frame::{
     connect_and_handshake, write_masked_frame, DecodedFrame, FastMaskRng, ParsedWsUrl,
     WsOpcode, WsReadBuffer,
@@ -503,6 +504,16 @@ impl WsStreamShard {
         registry: Arc<WsStreamRegistry>,
         handler: H,
     ) -> Result<Self, String> {
+        Self::connect_with_resiliency(url, registry, handler, None, None).await
+    }
+
+    pub async fn connect_with_resiliency<H: StreamHandler>(
+        url: &str,
+        registry: Arc<WsStreamRegistry>,
+        handler: H,
+        watchdog_feed: Option<Arc<AtomicI64>>,
+        network_gate: Option<Arc<NetworkGate>>,
+    ) -> Result<Self, String> {
         let parsed = ParsedWsUrl::parse(url, "")?;
         let mut read_buf = WsReadBuffer::new(256 * 1024);
         let stream = connect_and_handshake(&parsed, &mut read_buf).await?;
@@ -522,6 +533,8 @@ impl WsStreamShard {
             cmd_rx,
             frames_c,
             disc_c,
+            watchdog_feed,
+            network_gate,
         ));
 
         Ok(Self {
@@ -576,6 +589,8 @@ async fn run_shard_loop<H: StreamHandler>(
     mut cmd_rx: mpsc::UnboundedReceiver<ShardCommand>,
     frames_received: Arc<AtomicU64>,
     disconnected: Arc<AtomicBool>,
+    watchdog_feed: Option<Arc<AtomicI64>>,
+    network_gate: Option<Arc<NetworkGate>>,
 ) {
     let (mut reader, mut writer) = tokio::io::split(stream);
     let mut write_scratch = Vec::<u8>::with_capacity(4096);
@@ -587,6 +602,9 @@ async fn run_shard_loop<H: StreamHandler>(
     let next_req_id = AtomicI64::new(1);
     let mut pending_acks: HashMap<i64, oneshot::Sender<Result<(), String>>> = HashMap::new();
     let mut pong_scratch = [0u8; 125];
+    let mut graceful_close = false;
+
+    let feed_ref = watchdog_feed.as_deref();
 
     // Drain any frames that piggybacked on the HTTP 101 handshake packet
     let _ = process_buffered_frames(
@@ -596,6 +614,7 @@ async fn run_shard_loop<H: StreamHandler>(
         &mut bids_scratch,
         &mut asks_scratch,
         &frames_received,
+        feed_ref,
         &mut pending_acks,
         &mut writer,
         &mut mask_rng,
@@ -647,6 +666,7 @@ async fn run_shard_loop<H: StreamHandler>(
                             &mut mask_rng,
                             &mut write_scratch,
                         ).await;
+                        graceful_close = true;
                         break;
                     }
                 }
@@ -662,6 +682,7 @@ async fn run_shard_loop<H: StreamHandler>(
                             &mut bids_scratch,
                             &mut asks_scratch,
                             &frames_received,
+                            feed_ref,
                             &mut pending_acks,
                             &mut writer,
                             &mut mask_rng,
@@ -678,6 +699,11 @@ async fn run_shard_loop<H: StreamHandler>(
     }
 
     disconnected.store(true, Ordering::Release);
+    if !graceful_close {
+        if let Some(ref gate) = network_gate {
+            gate.trip();
+        }
+    }
     for (_, ack) in pending_acks.drain() {
         let _ = ack.send(Err("stream shard closed before ack".to_string()));
     }
@@ -697,6 +723,7 @@ async fn process_buffered_frames<H: StreamHandler>(
     bids_scratch: &mut Vec<DepthLevel>,
     asks_scratch: &mut Vec<DepthLevel>,
     frames_received: &AtomicU64,
+    watchdog_feed: Option<&AtomicI64>,
     pending_acks: &mut HashMap<i64, oneshot::Sender<Result<(), String>>>,
     writer: &mut WriteHalf<TcpStream>,
     mask_rng: &mut FastMaskRng,
@@ -708,7 +735,10 @@ async fn process_buffered_frames<H: StreamHandler>(
 
     loop {
         match read_buf.next_frame() {
-            Ok(Some(DecodedFrame::Message { payload, .. })) => {
+            Ok(Some(DecodedFrame::Message { payload, opcode, .. })) => {
+                if opcode == WsOpcode::Text && std::str::from_utf8(payload).is_err() {
+                    return false;
+                }
                 if !dispatch_stream_frame(
                     payload,
                     &routes,
@@ -723,6 +753,9 @@ async fn process_buffered_frames<H: StreamHandler>(
                     }
                 } else {
                     frames_received.fetch_add(1, Ordering::Relaxed);
+                    if let Some(feed) = watchdog_feed {
+                        feed.store(crate::rate_limiter::BinanceRateLimiter::utc_millis(), Ordering::Relaxed);
+                    }
                 }
             }
             Ok(Some(DecodedFrame::Ping(p))) => {
@@ -758,6 +791,7 @@ async fn process_buffered_frames<H: StreamHandler>(
             bids_scratch,
             asks_scratch,
             frames_received,
+            watchdog_feed,
             pending_acks,
             writer,
             mask_rng,
