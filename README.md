@@ -60,13 +60,13 @@ Measured with single-core execution on Apple M2:
 
 | Parser / Component | Latency (ns / op) | Throughput (ops / sec) | Heap Allocations |
 |:---|:---:|:---:|:---:|
-| `parse_book_ticker` | **80.4 ns** | **12.44 M msg/s** | **0 B** |
-| `parse_agg_trade` | **67.8 ns** | **14.75 M msg/s** | **0 B** |
-| `parse_depth_update` | **118.7 ns** | **8.42 M msg/s** | **0 B** |
-| `dispatch_stream (BookTicker + SeqLock publish)` | **126.0 ns** | **7.93 M msg/s** | **0 B** |
-| `parse_klines_into (500 bars into slice)` | **42.9 µs** | **23.27 K ops/s** | **0 B** |
-| `StackHttpRequest + HMAC-SHA256 signing` | **1.05 µs** | **0.95 M ops/s** | **0 B** |
-| `StackWsApiRequest + HMAC-SHA256 signing` | **1.49 µs** | **0.67 M ops/s** | **0 B** |
+| `parse_agg_trade` | **65.4 ns** | **15.30 M msg/s** | **0 B** |
+| `parse_book_ticker` | **103.7 ns** | **9.64 M msg/s** | **0 B** |
+| `parse_depth_update` | **112.8 ns** | **8.87 M msg/s** | **0 B** |
+| `dispatch_stream (BookTicker + SeqLock publish)` | **128.2 ns** | **7.80 M msg/s** | **0 B** |
+| `parse_klines_into (500 bars into slice)` | **41.7 µs** | **24.00 K ops/s** | **0 B** |
+| `StackHttpRequest + HMAC-SHA256 signing` | **1.09 µs** | **0.91 M ops/s** | **0 B** |
+| `StackWsApiRequest + HMAC-SHA256 signing` | **1.39 µs** | **0.72 M ops/s** | **0 B** |
 
 ---
 
